@@ -88,8 +88,6 @@ def detect_color_markers(image):
             center_x, center_y = x + w // 2, y + h // 2
             cv2.putText(display_img, f"ID:{marker_id}", (x, y - 25),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, display_color, 2)
-            cv2.putText(display_img, color_name, (x, y - 5),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, display_color, 2)
             
             # 追踪逻辑
             track_key = f"{marker_id}_{x//100}"  # 按位置区分同色多个标记
@@ -116,7 +114,7 @@ def detect_color_markers(image):
         queue.pop(i)
     
     # 显示状态
-    status_text = f"颜色标记检测: {detected_count} 个"
+    status_text = f"Color markers: {detected_count}"
     cv2.putText(display_img, status_text, (10, 30),
                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
     
@@ -124,7 +122,7 @@ def detect_color_markers(image):
     y_offset = 60
     for marker_id, (color_name, _, _, display_color) in list(COLOR_RANGES.items())[:5]:
         cv2.rectangle(display_img, (10, y_offset), (30, y_offset + 20), display_color, -1)
-        cv2.putText(display_img, f"ID{marker_id}: {color_name}", (35, y_offset + 15),
+        cv2.putText(display_img, f"ID{marker_id}", (35, y_offset + 15),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         y_offset += 25
     

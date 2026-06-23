@@ -82,7 +82,7 @@ def ana_image_apriltag(image):
     for i in po:
         queue.pop(i)
     
-    status_text = f"AprilTag 检测: {len(corners) if corners is not None else 0} 个"
+    status_text = f"AprilTag: {len(corners) if corners is not None else 0}"
     cv2.putText(display_img, status_text, (10, 30),
                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
     

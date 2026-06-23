@@ -7,112 +7,221 @@ import subprocess
 import requests
 from requests.auth import HTTPDigestAuth
 from socket import *
-from flask import Flask, Response, render_template
+from flask import Flask, Response, render_template, jsonify
+from collections import deque
 import threading
+
+from tag_tracker import TagTracker
 
 app = Flask(__name__, template_folder='templates')
 
 udpSocket = socket(AF_INET, SOCK_DGRAM)
 addr = ('192.168.81.20', 6789)
 
-# 自行设置
-rtmpUrl = "rtmp://192.168.81.16:1935/live/livestream"
-
 # 摄像头配置
 CAMERA_IP = "192.168.81.82"
 CAMERA_USER = "admin"
 CAMERA_PASS = "Zf123456789!"
 
-# 方式1: HTTP快照URL（海康摄像头，无残影）
-# 101=主码流（高分辨率），102=子码流（低分辨率）
-snapshot_url = f"http://{CAMERA_IP}/ISAPI/Streaming/channels/101/picture"
+# 101=主码流(分辨率高, 利于识别)  102=子码流(延迟略低)
+SNAPSHOT_CHANNEL = 101
+snapshot_url = f"http://{CAMERA_IP}/ISAPI/Streaming/channels/{SNAPSHOT_CHANNEL}/picture"
+camera_path = f"rtsp://{CAMERA_USER}:{CAMERA_PASS}@{CAMERA_IP}/h264/ch1/main/av_stream"
 
-# 方式2: RTSP流（备用）
-camera_path = f"rtsp://{CAMERA_USER}:{CAMERA_PASS}@{CAMERA_IP}/h264/ch1/sub/av_stream"
+USE_SNAPSHOT_MODE = False
+RTSP_FLUSH_FRAMES = 1  # 过多丢帧会导致快速通过的车辆漏扫
 
-# 使用快照模式（True）还是RTSP模式（False）
-USE_SNAPSHOT_MODE = True
+latest_gray = None
+latest_gray_id = 0
+gray_queue: deque[np.ndarray] = deque(maxlen=40)
+gray_lock = threading.Lock()
 
-queue = {}
+latest_display = None
+latest_display_id = 0
+display_lock = threading.Lock()
 
-# 用于线程间传递最新帧的变量
-latest_frame = None
-frame_lock = threading.Lock()
 capture_running = False
+detection_running = False
+stats_lock = threading.Lock()
+stats = {
+    "active_count": 0,
+    "total_in": 0,
+    "total_out": 0,
+    "fps_capture": 0.0,
+    "fps_detect": 0.0,
+    "last_detections": 0,
+    "queue_depth": 0,
+}
 
-# 预创建检测器（避免每帧重复创建，大幅提速）
-aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_1000)
-parameters = cv2.aruco.DetectorParameters()
-# 简化参数，提高速度
-parameters.adaptiveThreshConstant = 7
-parameters.adaptiveThreshWinSizeMin = 5
-parameters.adaptiveThreshWinSizeMax = 21
-parameters.adaptiveThreshWinSizeStep = 10
-parameters.minMarkerPerimeterRate = 0.03
-parameters.maxMarkerPerimeterRate = 4.0
-parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE  # 关闭角点精化，提速
-detector = cv.aruco.ArucoDetector(aruco_dict, parameters)
+# AprilTag 36h11 检测器（预创建，每帧复用）
+aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+detector_params = cv2.aruco.DetectorParameters()
+detector_params.adaptiveThreshConstant = 5
+detector_params.minMarkerPerimeterRate = 0.008
+detector_params.maxMarkerPerimeterRate = 4.0
+detector_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+detector = cv.aruco.ArucoDetector(aruco_dict, detector_params)
+clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
-def post_code(obj):
-    op = 'none'
-    if 'out' not in obj:
-        return
-    op = 'out' if (obj['_in'] - obj['out']) > 0 else 'in'
-    resjson = json.dumps({"op": op, "code": str(obj['_id'])})
-    udpSocket.sendto(resjson.encode('utf-8'), addr)
-
-def sharpen_image(gray):
-    """锐化图像，减轻拖影/模糊"""
-    # 使用Unsharp Mask锐化
-    blurred = cv2.GaussianBlur(gray, (0, 0), 3)
-    sharpened = cv2.addWeighted(gray, 2.0, blurred, -1.0, 0)
-    return sharpened
+tag_tracker = TagTracker()
 
 
-def ana_image(gray):
-    """分析灰度图像，直接返回灰度图，去除颜色处理"""
+def post_event(tag_id: int, op: str) -> None:
+    payload = json.dumps({"op": op, "code": str(tag_id)})
+    udpSocket.sendto(payload.encode('utf-8'), addr)
+    print(f"[{op.upper()}] 标签 ID={tag_id}")
+
+
+def marker_center(corners: np.ndarray) -> tuple[float, float]:
+    points = corners.reshape((4, 2))
+    cx = float(points[:, 0].mean())
+    cy = float(points[:, 1].mean())
+    return cx, cy
+
+
+def draw_zones(display_img: np.ndarray) -> None:
+    """绘制进出方向参考线"""
+    h = display_img.shape[0]
+    top_line = int(h * 0.15)
+    bottom_line = int(h * 0.85)
+
+    cv2.line(display_img, (0, top_line), (display_img.shape[1], top_line), (255, 200, 0), 1)
+    cv2.line(display_img, (0, bottom_line), (display_img.shape[1], bottom_line), (255, 200, 0), 1)
+    cv2.putText(display_img, "IN (top)", (10, top_line - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1)
+    cv2.putText(display_img, "OUT (bottom)", (10, bottom_line + 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1)
+
+
+def preprocess_for_detection(gray: np.ndarray) -> np.ndarray:
+    """提升低对比度场景下的标签边缘可见度。"""
+    return clahe.apply(gray)
+
+
+def ana_image(gray: np.ndarray) -> tuple[np.ndarray, int]:
     if gray is None or gray.size == 0:
-        return gray
-    
-    # 锐化图像减轻拖影
-    gray = sharpen_image(gray)
-    
-    # 直接在灰度图上检测
-    corners, ids, _ = detector.detectMarkers(gray)
-    
-    # 转为3通道灰度图用于显示标记（这样标记可以用彩色显示）
+        return gray, 0
+
+    h, w = gray.shape[:2]
+    tag_tracker.set_frame_height(h)
+
+    detect_gray = preprocess_for_detection(gray)
+    corners, ids, _ = detector.detectMarkers(detect_gray)
+
     display_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-    
-    # 画出标志位置
-    if corners is not None and len(corners) > 0:
+    draw_zones(display_img)
+
+    detections: list[tuple[int, float, float]] = []
+
+    if corners is not None and len(corners) > 0 and ids is not None:
         cv2.aruco.drawDetectedMarkers(display_img, corners, ids)
-        ids_flat = ids.flatten()
-        for (mr, marker_id) in zip(corners, ids_flat):
-            corner_points = mr.reshape((4, 2))
-            (topLeft, topRight, bottomRight, bottomLeft) = corner_points
-            topRight_coord = (int(topRight[0]), int(topRight[1]))
-            
-            cX = int((topLeft[0] + bottomRight[0]) / 2)
-            cY = int((topLeft[1] + bottomRight[1]) / 2)
-            cv2.putText(display_img, f"{marker_id}", (cX - 15, cY - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            
-            if marker_id not in queue:
-                queue[marker_id] = {"_id": int(marker_id), "_in": int(topRight_coord[1]), "first_time": time.time()}
+        for marker_corners, marker_id in zip(corners, ids.flatten()):
+            cx, cy = marker_center(marker_corners)
+            detections.append((int(marker_id), cx, cy))
+
+            cv2.circle(display_img, (int(cx), int(cy)), 6, (0, 255, 255), -1)
+            cv2.putText(display_img, f"#{marker_id}", (int(cx) - 20, int(cy) - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+
+    events = tag_tracker.update(detections)
+
+    for event in events:
+        post_event(event.tag_id, event.op)
+        with stats_lock:
+            if event.op == "in":
+                stats["total_in"] += 1
             else:
-                queue[marker_id]['out'] = int(topRight_coord[1])
-            print(f"ID:{marker_id} Y:{topRight_coord[1]}")
-    
-    # 清理过期的标记
-    po = [key for key in queue if (time.time() - queue[key]["first_time"] > 3)]
-    for i in po:
-        post_code(queue[i])
-        queue.pop(i)
-    
-    return display_img
+                stats["total_out"] += 1
+
+    with stats_lock:
+        stats["active_count"] = len(tag_tracker.active_tracks())
+        det_fps = stats["fps_detect"]
+        cap_fps = stats["fps_capture"]
+
+    for track in tag_tracker.active_tracks().values():
+        if len(track.y_samples) >= 2:
+            tail = 6
+            xs = track.x_samples[-tail:]
+            ys = track.y_samples[-tail:]
+            pts = np.array([[int(x), int(y)] for x, y in zip(xs, ys)], dtype=np.int32)
+            cv2.polylines(display_img, [pts], False, (0, 180, 255), 1)
+
+    status = (
+        f"AprilTag: {len(detections)} | Track: {stats['active_count']} | "
+        f"Cap {cap_fps}fps Det {det_fps}fps"
+    )
+    cv2.putText(display_img, status, (10, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 136), 2)
+
+    return display_img, len(detections)
+
+
+_capture_count = 0
+_capture_t0 = time.time()
+_detect_count = 0
+_detect_t0 = time.time()
+
+
+def _publish_gray(gray: np.ndarray) -> None:
+    """采集线程发布灰度帧，检测线程按序消费。"""
+    global latest_gray, latest_gray_id, _capture_count, _capture_t0
+
+    with gray_lock:
+        gray_queue.append(gray)
+        latest_gray = gray
+        latest_gray_id += 1
+        _capture_count += 1
+        elapsed = time.time() - _capture_t0
+        if elapsed >= 2.0:
+            with stats_lock:
+                stats["fps_capture"] = round(_capture_count / elapsed, 1)
+                stats["queue_depth"] = len(gray_queue)
+            _capture_count = 0
+            _capture_t0 = time.time()
+
+
+def _publish_display(display_img: np.ndarray, detections: int) -> None:
+    global latest_display, latest_display_id, _detect_count, _detect_t0
+
+    with display_lock:
+        latest_display = display_img
+        latest_display_id += 1
+        _detect_count += 1
+        elapsed = time.time() - _detect_t0
+        if elapsed >= 2.0:
+            with stats_lock:
+                stats["fps_detect"] = round(_detect_count / elapsed, 1)
+                stats["last_detections"] = detections
+            _detect_count = 0
+            _detect_t0 = time.time()
+
+
+def detection_thread_func():
+    """独立检测线程：按序处理采集帧，不依赖 Web 显示速度。"""
+    global detection_running
+
+    print("检测线程已启动（与 Web 显示解耦）")
+
+    while detection_running:
+        with gray_lock:
+            if not gray_queue:
+                time.sleep(0.001)
+                continue
+            gray = gray_queue.popleft()
+
+        try:
+            processed, det_count = ana_image(gray)
+        except Exception as e:
+            print(f"检测错误: {e}")
+            processed = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+            det_count = 0
+
+        _publish_display(processed, det_count)
+
+    print("检测线程已停止")
+
 
 def capture_thread_func():
-    """根据配置选择快照模式或RTSP模式"""
     if USE_SNAPSHOT_MODE:
         capture_thread_snapshot()
     else:
@@ -120,32 +229,31 @@ def capture_thread_func():
 
 
 def capture_thread_snapshot():
-    """HTTP快照模式 - 完全无残影"""
-    global latest_frame, capture_running
-    
-    # 使用Digest认证（海康摄像头要求）
+    global capture_running
+
     auth = HTTPDigestAuth(CAMERA_USER, CAMERA_PASS)
-    
-    # 创建Session复用连接
     session = requests.Session()
     session.auth = auth
-    
+
     print(f"使用HTTP快照模式: {snapshot_url}")
+    print("提示: 快照模式延迟较高，快速移动时易出现残影，建议改用 RTSP")
     error_count = 0
-    
+
     while capture_running:
         try:
-            # 发送HTTP请求获取JPEG快照
-            response = session.get(snapshot_url, timeout=2, stream=True)
-            
+            response = session.get(
+                snapshot_url,
+                params={"time": int(time.time() * 1000)},
+                headers={"Cache-Control": "no-cache"},
+                timeout=2,
+            )
+
             if response.status_code == 200:
-                # 解码JPEG为numpy数组
                 img_array = np.frombuffer(response.content, dtype=np.uint8)
                 frame = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
-                
+
                 if frame is not None:
-                    with frame_lock:
-                        latest_frame = frame
+                    _publish_gray(frame)
                     error_count = 0
                 else:
                     error_count += 1
@@ -153,29 +261,74 @@ def capture_thread_snapshot():
                 error_count += 1
                 if error_count % 10 == 1:
                     print(f"快照获取失败: HTTP {response.status_code}")
-                
+
         except Exception as e:
             error_count += 1
             if error_count % 10 == 1:
                 print(f"快照获取失败: {e}")
             time.sleep(0.1)
-            
-        # 控制帧率约10-15fps
-        time.sleep(0.05)
-    
+
+        time.sleep(0.08)
+
     session.close()
 
 
 def capture_thread_rtsp():
-    """RTSP模式（备用）"""
-    global latest_frame, capture_running
-    
-    width = 640
-    height = 360
-    
+    """优先 OpenCV 低延迟 RTSP；失败时回退 FFmpeg。"""
+    global capture_running
+    import os
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+        "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|max_delay;0"
+    )
+
     while capture_running:
-        print(f"正在连接摄像头: {camera_path}")
-        
+        cap = cv2.VideoCapture(camera_path, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        if not cap.isOpened():
+            cap.release()
+            if capture_thread_rtsp_ffmpeg():
+                return
+            time.sleep(3)
+            continue
+
+        print(f"RTSP 低延迟模式: {camera_path}")
+
+        # 连接后先清空缓冲
+        for _ in range(RTSP_FLUSH_FRAMES * 2):
+            cap.grab()
+
+        while capture_running:
+            for _ in range(RTSP_FLUSH_FRAMES):
+                cap.grab()
+
+            ret, frame = cap.retrieve()
+            if not ret or frame is None:
+                print("RTSP 断流，重连...")
+                break
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            _publish_gray(gray)
+
+        cap.release()
+        time.sleep(1)
+
+
+def capture_thread_rtsp_ffmpeg() -> bool:
+    global capture_running
+
+    width = 1280
+    height = 720
+
+    try:
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        print("OpenCV RTSP 失败且未找到 ffmpeg")
+        return False
+
+    while capture_running:
+        print(f"FFmpeg RTSP 回退: {camera_path}")
+
         ffmpeg_cmd = [
             'ffmpeg',
             '-rtsp_transport', 'tcp',
@@ -183,9 +336,8 @@ def capture_thread_rtsp():
             '-flags', 'low_delay',
             '-max_delay', '0',
             '-reorder_queue_size', '0',
-            '-skip_frame', 'nointra',
             '-i', camera_path,
-            '-vf', 'fps=10',
+            '-vf', 'fps=20',
             '-vsync', 'drop',
             '-an',
             '-f', 'rawvideo',
@@ -193,7 +345,7 @@ def capture_thread_rtsp():
             '-s', f'{width}x{height}',
             '-'
         ]
-        
+
         try:
             process = subprocess.Popen(
                 ffmpeg_cmd,
@@ -201,84 +353,42 @@ def capture_thread_rtsp():
                 stderr=subprocess.DEVNULL,
                 bufsize=0
             )
-            print("FFmpeg RTSP模式")
-        except FileNotFoundError:
-            print("找不到ffmpeg，回退到OpenCV...")
-            capture_thread_opencv()
-            return
         except Exception as e:
-            print(f"ffmpeg失败: {e}")
-            time.sleep(3)
-            continue
-        
+            print(f"ffmpeg 启动失败: {e}")
+            return False
+
         frame_size = width * height
         error_count = 0
-        
+
         while capture_running:
             try:
                 raw_frame = process.stdout.read(frame_size)
-                
+
                 if len(raw_frame) != frame_size:
                     error_count += 1
                     if error_count > 50:
                         break
                     continue
-                
+
                 error_count = 0
                 gray = np.frombuffer(raw_frame, dtype=np.uint8).reshape((height, width))
-                
-                with frame_lock:
-                    latest_frame = gray
-                    
-            except:
+                _publish_gray(gray)
+
+            except Exception:
                 break
-        
+
         try:
             process.terminate()
             process.wait(timeout=2)
-        except:
+        except Exception:
             process.kill()
-        
+
         time.sleep(1)
 
-
-def capture_thread_opencv():
-    """备用：OpenCV模式（当ffmpeg不可用时）"""
-    global latest_frame, capture_running
-    import os
-    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
-    
-    while capture_running:
-        cap = cv2.VideoCapture(camera_path, cv2.CAP_FFMPEG)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 0)
-        
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(camera_path)
-            
-        if not cap.isOpened():
-            time.sleep(3)
-            continue
-        
-        print("OpenCV模式连接成功")
-        
-        while capture_running:
-            # 激进丢帧：丢弃10帧只取1帧
-            for _ in range(10):
-                cap.grab()
-            
-            ret, frame = cap.retrieve()
-            if not ret or frame is None:
-                break
-            
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            with frame_lock:
-                latest_frame = gray
-        
-        cap.release()
+    return True
 
 
 def start_capture_thread():
-    """启动帧捕获线程"""
     global capture_running
     capture_running = True
     thread = threading.Thread(target=capture_thread_func, daemon=True)
@@ -286,65 +396,87 @@ def start_capture_thread():
     print("帧捕获线程已启动")
 
 
+def start_detection_thread():
+    global detection_running
+    detection_running = True
+    thread = threading.Thread(target=detection_thread_func, daemon=True)
+    thread.start()
+
+
+def start_workers():
+    start_capture_thread()
+    start_detection_thread()
+
+
 def generate_frames():
-    """生成视频帧的生成器 - 从最新帧变量读取，避免残影"""
-    global latest_frame
-    
-    # 确保捕获线程已启动
+    global latest_display, latest_display_id
+
     if not capture_running:
-        start_capture_thread()
-    
-    # 等待第一帧
-    while latest_frame is None:
+        start_workers()
+
+    while latest_display is None:
         time.sleep(0.05)
-    
-    # JPEG编码参数：低质量=快速
+
     encode_params = [cv2.IMWRITE_JPEG_QUALITY, 70]
-    
+    last_sent_id = -1
+
     while True:
-        # 获取最新帧（灰度图）
-        with frame_lock:
-            if latest_frame is None:
-                time.sleep(0.01)
+        with display_lock:
+            if latest_display is None or latest_display_id == last_sent_id:
+                time.sleep(0.005)
                 continue
-            gray = latest_frame
-        
-        # 处理图像（已经是灰度图）
-        try:
-            processed_frame = ana_image(gray)
-        except Exception as e:
-            print(f"处理错误: {e}")
-            processed_frame = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-        
-        # 编码为JPEG
-        ret, buffer = cv2.imencode('.jpg', processed_frame, encode_params)
+            frame = latest_display.copy()
+            frame_id = latest_display_id
+
+        ret, buffer = cv2.imencode('.jpg', frame, encode_params)
         if not ret:
             continue
-        
-        # 以MJPEG格式输出
+
+        last_sent_id = frame_id
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
 
+
 @app.route('/')
 def index():
-    """主页"""
     return render_template('index.html')
+
 
 @app.route('/video_feed')
 def video_feed():
-    """视频流路由"""
     return Response(generate_frames(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
-if __name__ == '__main__':
-    print("启动Web服务器...")
-    print("访问 http://localhost:5000 查看分析画面")
-    
-    # 预先启动帧捕获线程
-    start_capture_thread()
-    
-    # 等待一下让线程初始化
-    time.sleep(1)
-    
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
 
+@app.route('/api/stats')
+def api_stats():
+    with stats_lock:
+        current_stats = dict(stats)
+
+    events = [
+        {
+            "tag_id": e.tag_id,
+            "op": e.op,
+            "op_label": "入库" if e.op == "in" else "出库",
+            "displacement": round(e.displacement, 1),
+            "duration": round(e.duration, 2),
+            "timestamp": e.timestamp,
+        }
+        for e in tag_tracker.recent_events
+    ]
+
+    return jsonify({
+        **current_stats,
+        "events": events,
+        "rejected_short": tag_tracker.rejected_short,
+        "rejected_static": tag_tracker.rejected_static,
+    })
+
+
+if __name__ == '__main__':
+    print("启动 AprilTag 车辆监控服务器...")
+    print("摄像头建议: 曝光手动 1/500~1/2000, 关闭 WDR/3DNR, 增益适中")
+    print("访问 http://localhost:5000 查看分析画面")
+    start_workers()
+    time.sleep(1)
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
