@@ -38,11 +38,29 @@ DETECTOR_BACKEND=pupil      # pupil or opencv
 PROCESS_WIDTH=640
 PROCESS_HEIGHT=360
 DETECT_WIDTH=480
+DETECT_PADDING=24
 CAPTURE_FPS=20
 RTSP_STREAM=sub
 RTSP_CODEC=h264
 PUPIL_QUAD_DECIMATE=2.0
 PUPIL_THREADS=4
+
+# Motion-gated detection. Only moving regions are scanned for AprilTags.
+MOTION_GATE=true
+MOTION_MIN_AREA=80
+MOTION_THRESHOLD=18
+MOTION_EXPAND=0.18
+MOTION_FULL_SCAN_INTERVAL=0
+MOTION_MAX_AREA_RATIO=0.45
+MOTION_BG_ALPHA=0.02
+IDLE_SCAN_INTERVAL=5
+STARTUP_SCAN_FRAMES=12
+SCAN_HOLD_SECONDS=1.2
+SCAN_ROI_MIN_WIDTH=260
+SCAN_ROI_MIN_HEIGHT=180
+SCAN_FULL_EVERY=8
+EDGE_SCAN_INTERVAL=2
+EDGE_SCAN_HEIGHT_RATIO=0.38
 
 # Optional detection crop as frame ratios.
 ROI_X_MIN=0.0
@@ -61,6 +79,30 @@ With the `pupil` detector, `PUPIL_QUAD_DECIMATE` is the main speed/accuracy
 knob. Use `2.0` first; if tags are missed, try `1.5` or `1.0`. If speed is
 still too low and tags are large, try `3.0`.
 
+The default detector is motion-gated. This avoids scanning the entire complex
+scene when only a vehicle-sized region matters. If the purple ROI rectangle in
+the web view is too small or misses the vehicle, raise `MOTION_EXPAND`; if it
+reacts to too much background noise, raise `MOTION_MIN_AREA` or
+`MOTION_THRESHOLD`. If static compression noise still creates a nearly full
+frame ROI, lower `MOTION_MAX_AREA_RATIO`. To disable this strategy, set
+`MOTION_GATE=false`.
+
+For stuttering vehicles or unstable motion boxes, keep scan windows forgiving:
+`SCAN_HOLD_SECONDS` keeps scanning the last vehicle ROI after motion pauses,
+`SCAN_ROI_MIN_WIDTH/HEIGHT` prevent the ROI from becoming too tight, and
+`SCAN_FULL_EVERY` periodically scans the configured full ROI while motion is
+active to recover tags that were just outside the motion box.
+`IDLE_SCAN_INTERVAL` performs a low-rate fallback scan when no motion is
+detected, which helps with vehicles that stop before the tag is read.
+`STARTUP_SCAN_FRAMES` forces full scans immediately after startup so the first
+vehicle is not missed while the motion background model is warming up.
+`EDGE_SCAN_INTERVAL` scans the top and bottom bands regularly. This protects
+against tags near the entry/exit edges where motion gating may not produce a
+stable box.
+`DETECT_PADDING` adds a white border around cropped detection images. Keep it
+enabled for tags close to the image edge; AprilTag detectors need visible quiet
+space around the black tag border.
+
 Diagnostics
 -----------
 
@@ -68,9 +110,13 @@ Use `http://localhost:5000/api/stats` to separate capture and detection
 problems:
 
 - `fps_capture`: frames actually received from the camera pipeline.
-- `fps_detect`: frames processed by the detection thread.
+- `fps_detect`: frames processed by the lightweight motion loop.
+- `fps_tag`: AprilTag detector jobs completed per second.
 - `capture_interval_ms`: time between received frames.
-- `detect_ms`: AprilTag detection and tracking time for one frame.
+- `detect_ms`: lightweight motion loop time for one frame.
+- `motion_ms`: motion ROI calculation time.
+- `tag_ms`: native AprilTag detector time for one ROI.
+- `render_ms`: display overlay rendering time, now handled by a separate thread.
 - `frame_age_ms`: how old the latest frame was when detection started.
 
 Use `http://localhost:5000/api/benchmark` to test AprilTag detector speed

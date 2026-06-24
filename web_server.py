@@ -10,11 +10,7 @@ from requests.auth import HTTPDigestAuth
 from socket import *
 from flask import Flask, Response, render_template, jsonify
 import threading
-
-try:
-    from pupil_apriltags import Detector as PupilDetector
-except Exception:
-    PupilDetector = None
+from collections import deque
 
 from tag_tracker import TagTracker
 
@@ -64,32 +60,44 @@ camera_path = os.getenv(
 )
 
 CAPTURE_BACKEND = os.getenv("CAPTURE_BACKEND", "ffmpeg").lower()
-DETECTOR_BACKEND = os.getenv(
-    "DETECTOR_BACKEND",
-    "pupil" if PupilDetector is not None else "opencv",
-).lower()
+ARUCO_DICTIONARY = os.getenv("ARUCO_DICTIONARY", "DICT_6X6_1000")
 USE_SNAPSHOT_MODE = _env_bool("USE_SNAPSHOT_MODE", False)
 RTSP_FLUSH_FRAMES = _env_int("RTSP_FLUSH_FRAMES", 1)
 USE_GPU_DECODE = _env_bool("USE_GPU_DECODE", False)
 
 # 核心性能策略：采集端直接输出算法需要的低分辨率灰度帧。
-# 车辆进出只依赖纵向轨迹，不需要对 720p/1080p 整帧做 AprilTag 检测。
+# 车辆进出只依赖纵向轨迹，不需要对 720p/1080p 整帧做 ArUco 检测。
 PROCESS_WIDTH = _env_int("PROCESS_WIDTH", 640)
 PROCESS_HEIGHT = _env_int("PROCESS_HEIGHT", 360)
 DETECT_WIDTH = _env_int("DETECT_WIDTH", 480)
+DETECT_PADDING = _env_int("DETECT_PADDING", 24)
 ROI_X_MIN = _env_float("ROI_X_MIN", 0.0)
 ROI_X_MAX = _env_float("ROI_X_MAX", 1.0)
 ROI_Y_MIN = _env_float("ROI_Y_MIN", 0.0)
 ROI_Y_MAX = _env_float("ROI_Y_MAX", 1.0)
+MOTION_GATE = _env_bool("MOTION_GATE", True)
+MOTION_MIN_AREA = _env_int("MOTION_MIN_AREA", 80)
+MOTION_THRESHOLD = _env_int("MOTION_THRESHOLD", 18)
+MOTION_EXPAND = _env_float("MOTION_EXPAND", 0.18)
+MOTION_FULL_SCAN_INTERVAL = _env_int("MOTION_FULL_SCAN_INTERVAL", 0)
+MOTION_MAX_AREA_RATIO = _env_float("MOTION_MAX_AREA_RATIO", 0.45)
+MOTION_WIDTH = _env_int("MOTION_WIDTH", 160)
+MOTION_BG_ALPHA = _env_float("MOTION_BG_ALPHA", 0.02)
+IDLE_SCAN_INTERVAL = _env_int("IDLE_SCAN_INTERVAL", 5)
+STARTUP_SCAN_FRAMES = _env_int("STARTUP_SCAN_FRAMES", 12)
+SCAN_HOLD_SECONDS = _env_float("SCAN_HOLD_SECONDS", 1.2)
+SCAN_ROI_MIN_WIDTH = _env_int("SCAN_ROI_MIN_WIDTH", 260)
+SCAN_ROI_MIN_HEIGHT = _env_int("SCAN_ROI_MIN_HEIGHT", 180)
+SCAN_FULL_EVERY = _env_int("SCAN_FULL_EVERY", 8)
+EDGE_SCAN_INTERVAL = _env_int("EDGE_SCAN_INTERVAL", 2)
+EDGE_SCAN_HEIGHT_RATIO = _env_float("EDGE_SCAN_HEIGHT_RATIO", 0.38)
 CAPTURE_FPS = _env_int("CAPTURE_FPS", 20)
 DISPLAY_MAX_WIDTH = _env_int("DISPLAY_MAX_WIDTH", 960)
-RENDER_INTERVAL = _env_float("RENDER_INTERVAL", 0.08)
-PUPIL_THREADS = min(_env_int("PUPIL_THREADS", 4), os.cpu_count() or 4)
-PUPIL_QUAD_DECIMATE = _env_float("PUPIL_QUAD_DECIMATE", 2.0)
-PUPIL_DECODE_SHARPENING = _env_float("PUPIL_DECODE_SHARPENING", 0.25)
+RENDER_FPS = _env_int("RENDER_FPS", CAPTURE_FPS)
+RENDER_INTERVAL = max(0.02, 1.0 / max(1, RENDER_FPS))
+JPEG_QUALITY = _env_int("JPEG_QUALITY", 65)
 OPENCV_MIN_PERIMETER = _env_float("OPENCV_MIN_PERIMETER", 0.03)
 OPENCV_ADAPTIVE_MAX = _env_int("OPENCV_ADAPTIVE_MAX", 15)
-BENCHMARK_PUPIL = _env_bool("BENCHMARK_PUPIL", False)
 
 cv2.setUseOptimized(True)
 cv2.setNumThreads(max(1, min(4, os.cpu_count() or 1)))
@@ -99,15 +107,18 @@ latest_gray_id = 0
 gray_lock = threading.Lock()
 gray_ready = threading.Event()
 
-latest_display = None
-latest_display_id = 0
+latest_jpeg: bytes | None = None
+latest_jpeg_id = 0
 display_lock = threading.Lock()
 
 capture_running = False
 detection_running = False
+render_running = False
 worker_lock = threading.Lock()
 capture_thread: threading.Thread | None = None
 detection_thread: threading.Thread | None = None
+tag_worker_thread: threading.Thread | None = None
+render_thread: threading.Thread | None = None
 stats_lock = threading.Lock()
 stats = {
     "active_count": 0,
@@ -115,41 +126,40 @@ stats = {
     "total_out": 0,
     "fps_capture": 0.0,
     "fps_detect": 0.0,
+    "fps_tag": 0.0,
+    "fps_render": 0.0,
     "capture_interval_ms": 0.0,
     "detect_ms": 0.0,
+    "motion_ms": 0.0,
+    "tag_ms": 0.0,
     "render_ms": 0.0,
     "frame_age_ms": 0.0,
     "last_detections": 0,
     "queue_depth": 0,
+    "tag_queue_depth": 0,
     "dropped_frames": 0,
     "decode_backend": "unknown",
-    "detect_backend": DETECTOR_BACKEND,
+    "detect_backend": "opencv",
+    "aruco_dictionary": ARUCO_DICTIONARY,
     "frame_size": f"{PROCESS_WIDTH}x{PROCESS_HEIGHT}",
     "detect_size": "",
     "detect_roi": "",
+    "motion_gate": MOTION_GATE,
+    "motion_area": 0,
+    "motion_ratio": 0.0,
+    "scan_hold": SCAN_HOLD_SECONDS,
+    "scan_roi_source": "",
+    "startup_scan_frames": STARTUP_SCAN_FRAMES,
+    "edge_scan_interval": EDGE_SCAN_INTERVAL,
 }
 
 
-class AprilTagDetector:
-    def __init__(self, backend: str):
-        self.backend = backend
-        self._opencv_detector = None
-        self._pupil_detector = None
-
-        if backend == "pupil":
-            if PupilDetector is None:
-                raise RuntimeError("pupil-apriltags is not installed")
-            self._pupil_detector = PupilDetector(
-                families="tag36h11",
-                nthreads=PUPIL_THREADS,
-                quad_decimate=PUPIL_QUAD_DECIMATE,
-                quad_sigma=0.0,
-                refine_edges=False,
-                decode_sharpening=PUPIL_DECODE_SHARPENING,
-            )
-            return
-
-        aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+class ArucoDetector:
+    def __init__(self, dictionary_name: str = ARUCO_DICTIONARY):
+        dict_attr = getattr(cv2.aruco, dictionary_name, None)
+        if dict_attr is None:
+            raise ValueError(f"未知 ArUco 字典: {dictionary_name}")
+        aruco_dict = cv2.aruco.getPredefinedDictionary(dict_attr)
         params = cv2.aruco.DetectorParameters()
         params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE
         params.minMarkerPerimeterRate = OPENCV_MIN_PERIMETER
@@ -157,42 +167,45 @@ class AprilTagDetector:
         params.adaptiveThreshWinSizeMin = 3
         params.adaptiveThreshWinSizeMax = OPENCV_ADAPTIVE_MAX
         params.adaptiveThreshWinSizeStep = 10
-        self._opencv_detector = cv2.aruco.ArucoDetector(aruco_dict, params)
+        self._detector = cv2.aruco.ArucoDetector(aruco_dict, params)
         self.backend = "opencv"
+        self.dictionary = dictionary_name
 
     def detect(self, gray: np.ndarray) -> tuple[list[np.ndarray], np.ndarray | None]:
         gray = np.ascontiguousarray(gray)
-        if self.backend == "pupil":
-            results = self._pupil_detector.detect(gray)
-            if not results:
-                return [], None
-            corners = [det.corners.reshape(1, 4, 2).astype(np.float32) for det in results]
-            ids = np.array([int(det.tag_id) for det in results], dtype=np.int32).reshape(-1, 1)
-            return corners, ids
-
-        corners, ids, _ = self._opencv_detector.detectMarkers(gray)
+        corners, ids, _ = self._detector.detectMarkers(gray)
         if ids is None:
             return [], None
         return corners, ids
 
 
-try:
-    april_detector = AprilTagDetector(DETECTOR_BACKEND)
-except Exception as exc:
-    print(f"检测器 {DETECTOR_BACKEND} 初始化失败，回退 OpenCV: {exc}")
-    april_detector = AprilTagDetector("opencv")
-    DETECTOR_BACKEND = "opencv"
-    stats["detect_backend"] = "opencv"
+aruco_detector = ArucoDetector()
 
 tag_tracker = TagTracker()
 
-# 检测与渲染分离：检测全速，画面按 RENDER_INTERVAL 刷新
+# 检测与渲染分离：检测全速，画面跟随采集帧率刷新
 _overlay_lock = threading.Lock()
+_overlay_ready = threading.Event()
 _overlay = {
     "gray": None,
     "markers": [],
     "tracks": [],
 }
+
+_motion_lock = threading.Lock()
+_motion_bg: np.ndarray | None = None
+_detect_iteration = 0
+_active_scan_roi: tuple[int, int, int, int] | None = None
+_active_scan_until = 0.0
+_scan_submit_count = 0
+
+_tag_task_lock = threading.Lock()
+_tag_task_event = threading.Event()
+_tag_tasks: deque[dict] = deque(maxlen=8)
+_tag_worker_running = False
+_tag_count = 0
+_tag_t0 = time.time()
+_tag_latest_det_count = 0
 
 
 def post_event(tag_id: int, op: str) -> None:
@@ -246,8 +259,7 @@ def _clip_ratio(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
-def detection_window(gray: np.ndarray) -> tuple[np.ndarray, int, int, float]:
-    """Return cropped/scaled image plus offset and scale back to full frame."""
+def base_roi(gray: np.ndarray) -> tuple[int, int, int, int]:
     h, w = gray.shape[:2]
     x1 = int(w * _clip_ratio(ROI_X_MIN))
     x2 = int(w * _clip_ratio(ROI_X_MAX))
@@ -258,23 +270,242 @@ def detection_window(gray: np.ndarray) -> tuple[np.ndarray, int, int, float]:
         x1, x2 = 0, w
     if y2 <= y1:
         y1, y2 = 0, h
+    return x1, y1, x2, y2
+
+
+def clamp_roi(
+    roi: tuple[int, int, int, int],
+    bounds: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = roi
+    bx1, by1, bx2, by2 = bounds
+    return max(bx1, x1), max(by1, y1), min(bx2, x2), min(by2, y2)
+
+
+def expand_to_min_size(
+    roi: tuple[int, int, int, int],
+    bounds: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = roi
+    cx = (x1 + x2) // 2
+    cy = (y1 + y2) // 2
+    width = max(x2 - x1, SCAN_ROI_MIN_WIDTH)
+    height = max(y2 - y1, SCAN_ROI_MIN_HEIGHT)
+    expanded = (
+        cx - width // 2,
+        cy - height // 2,
+        cx + (width + 1) // 2,
+        cy + (height + 1) // 2,
+    )
+    return clamp_roi(expanded, bounds)
+
+
+def union_roi(
+    a: tuple[int, int, int, int],
+    b: tuple[int, int, int, int],
+    bounds: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    return clamp_roi(
+        (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])),
+        bounds,
+    )
+
+
+def motion_roi(gray: np.ndarray, base: tuple[int, int, int, int]) -> tuple[int, int, int, int] | None:
+    """Find moving region inside configured ROI. Returns None when no motion."""
+    global _motion_bg
+
+    motion_t0 = time.perf_counter()
+
+    if not MOTION_GATE:
+        return base
+
+    x1, y1, x2, y2 = base
+    roi = gray[y1:y2, x1:x2]
+    if roi.size == 0:
+        return base
+
+    motion_scale = min(1.0, MOTION_WIDTH / roi.shape[1]) if roi.shape[1] else 1.0
+    if motion_scale < 1.0:
+        motion_img = cv2.resize(
+            roi,
+            (max(1, int(roi.shape[1] * motion_scale)), max(1, int(roi.shape[0] * motion_scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+    else:
+        motion_img = roi
+
+    small = cv2.GaussianBlur(motion_img, (5, 5), 0)
+    with _motion_lock:
+        if _motion_bg is None or _motion_bg.shape != small.shape:
+            _motion_bg = small.astype(np.float32)
+            with stats_lock:
+                stats["motion_area"] = 0
+                stats["motion_ratio"] = 0.0
+                stats["motion_ms"] = round((time.perf_counter() - motion_t0) * 1000, 2)
+            return None
+        bg_uint8 = cv2.convertScaleAbs(_motion_bg)
+        diff = cv2.absdiff(small, bg_uint8)
+        cv2.accumulateWeighted(small, _motion_bg, MOTION_BG_ALPHA)
+
+    _, mask = cv2.threshold(diff, MOTION_THRESHOLD, 255, cv2.THRESH_BINARY)
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.dilate(mask, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+    total_area = 0
+    for contour in contours:
+        area = int(cv2.contourArea(contour))
+        if area < MOTION_MIN_AREA:
+            continue
+        bx, by, bw, bh = cv2.boundingRect(contour)
+        boxes.append((bx, by, bx + bw, by + bh))
+        total_area += area
+
+    with stats_lock:
+        stats["motion_area"] = total_area
+        stats["motion_ms"] = round((time.perf_counter() - motion_t0) * 1000, 2)
+
+    if not boxes:
+        with stats_lock:
+            stats["motion_ratio"] = 0.0
+        return None
+
+    inv_motion_scale = 1.0 / motion_scale if motion_scale else 1.0
+    mx1 = int(min(b[0] for b in boxes) * inv_motion_scale) + x1
+    my1 = int(min(b[1] for b in boxes) * inv_motion_scale) + y1
+    mx2 = int(max(b[2] for b in boxes) * inv_motion_scale) + x1
+    my2 = int(max(b[3] for b in boxes) * inv_motion_scale) + y1
+
+    base_area = max(1, (x2 - x1) * (y2 - y1))
+    box_ratio = ((mx2 - mx1) * (my2 - my1)) / base_area
+    with stats_lock:
+        stats["motion_ratio"] = round(box_ratio, 3)
+    if box_ratio > MOTION_MAX_AREA_RATIO:
+        return None
+
+    expand_x = int((mx2 - mx1) * MOTION_EXPAND)
+    expand_y = int((my2 - my1) * MOTION_EXPAND)
+    mx1 = max(x1, mx1 - expand_x)
+    my1 = max(y1, my1 - expand_y)
+    mx2 = min(x2, mx2 + expand_x)
+    my2 = min(y2, my2 + expand_y)
+
+    if mx2 <= mx1 or my2 <= my1:
+        return None
+    return mx1, my1, mx2, my2
+
+
+def detection_window(gray: np.ndarray) -> tuple[np.ndarray | None, int, int, float]:
+    """Return cropped/scaled image plus offset and scale back to full frame."""
+    global _detect_iteration, _active_scan_roi, _active_scan_until, _scan_submit_count
+
+    _detect_iteration += 1
+    base = base_roi(gray)
+    now = time.time()
+
+    if _detect_iteration <= STARTUP_SCAN_FRAMES:
+        roi = base
+        roi_source = "startup-full"
+        with stats_lock:
+            stats["motion_area"] = 0
+            stats["motion_ratio"] = 0.0
+    else:
+        roi = None
+        roi_source = "motion"
+
+    if roi is None:
+        motion = motion_roi(gray, base)
+
+        if motion is not None:
+            motion = expand_to_min_size(motion, base)
+            if _active_scan_roi is not None and now < _active_scan_until:
+                motion = union_roi(_active_scan_roi, motion, base)
+            _active_scan_roi = motion
+            _active_scan_until = now + SCAN_HOLD_SECONDS
+            roi = motion
+        elif _active_scan_roi is not None and now < _active_scan_until:
+            roi = _active_scan_roi
+            roi_source = "hold"
+        else:
+            _active_scan_roi = None
+
+    if roi is None:
+        if IDLE_SCAN_INTERVAL > 0 and _detect_iteration % IDLE_SCAN_INTERVAL == 0:
+            roi = base
+            roi_source = "idle-full"
+        elif MOTION_FULL_SCAN_INTERVAL > 0 and _detect_iteration % MOTION_FULL_SCAN_INTERVAL == 0:
+            roi = base
+            roi_source = "interval-full"
+        else:
+            with stats_lock:
+                stats["detect_size"] = "skipped"
+                stats["detect_roi"] = "motion:none"
+                stats["scan_roi_source"] = "skipped"
+            return None, 0, 0, 1.0
+
+    if SCAN_FULL_EVERY > 0 and _active_scan_roi is not None:
+        _scan_submit_count += 1
+        if _scan_submit_count % SCAN_FULL_EVERY == 0:
+            roi = base
+            roi_source = "fallback-full"
+
+    detect_img, offset_x, offset_y, scale = build_detection_crop(gray, roi)
+    if detect_img is None:
+        return None, 0, 0, 1.0
+
+    with stats_lock:
+        stats["detect_size"] = f"{detect_img.shape[1]}x{detect_img.shape[0]}"
+        stats["detect_roi"] = f"{roi[0]},{roi[1]},{roi[2]},{roi[3]}"
+        stats["scan_roi_source"] = roi_source
+
+    return detect_img, offset_x, offset_y, scale
+
+
+def build_detection_crop(
+    gray: np.ndarray,
+    roi: tuple[int, int, int, int],
+) -> tuple[np.ndarray | None, float, float, float]:
+    x1, y1, x2, y2 = clamp_roi(roi, base_roi(gray))
+    if x2 <= x1 or y2 <= y1:
+        return None, 0, 0, 1.0
 
     crop = gray[y1:y2, x1:x2]
     scale = min(1.0, DETECT_WIDTH / crop.shape[1]) if crop.shape[1] else 1.0
     if scale < 1.0:
-        detect_img = cv2.resize(
+        crop = cv2.resize(
             crop,
             (max(1, int(crop.shape[1] * scale)), max(1, int(crop.shape[0] * scale))),
             interpolation=cv2.INTER_AREA,
         )
-    else:
-        detect_img = crop
 
-    with stats_lock:
-        stats["detect_size"] = f"{detect_img.shape[1]}x{detect_img.shape[0]}"
-        stats["detect_roi"] = f"{x1},{y1},{x2},{y2}"
+    if DETECT_PADDING > 0:
+        crop = cv2.copyMakeBorder(
+            crop,
+            DETECT_PADDING,
+            DETECT_PADDING,
+            DETECT_PADDING,
+            DETECT_PADDING,
+            cv2.BORDER_CONSTANT,
+            value=255,
+        )
+        inv_scale = 1.0 / scale if scale else 1.0
+        return crop, x1 - DETECT_PADDING * inv_scale, y1 - DETECT_PADDING * inv_scale, scale
 
-    return detect_img, x1, y1, scale
+    return crop, x1, y1, scale
+
+
+def edge_scan_rois(gray: np.ndarray) -> list[tuple[int, int, int, int]]:
+    if EDGE_SCAN_INTERVAL <= 0 or _detect_iteration % EDGE_SCAN_INTERVAL != 0:
+        return []
+
+    x1, y1, x2, y2 = base_roi(gray)
+    height = max(1, int((y2 - y1) * _clip_ratio(EDGE_SCAN_HEIGHT_RATIO)))
+    top = (x1, y1, x2, min(y2, y1 + height))
+    bottom = (x1, max(y1, y2 - height), x2, y2)
+    return [top, bottom]
 
 
 def map_corners_to_frame(
@@ -298,24 +529,32 @@ def map_corners_to_frame(
     return mapped
 
 
-def detect_and_track(gray: np.ndarray) -> int:
-    """纯检测+追踪，不做画面渲染。"""
-    h, w = gray.shape[:2]
-    tag_tracker.set_frame_height(h)
+def publish_overlay(gray: np.ndarray, markers: list | None = None) -> None:
+    with _overlay_lock:
+        _overlay["gray"] = gray
+        if markers is not None:
+            _overlay["markers"] = markers
+        _overlay["tracks"] = list(tag_tracker.active_tracks().values())
+    _overlay_ready.set()
 
-    detect_img, offset_x, offset_y, scale = detection_window(gray)
-    corners, ids = april_detector.detect(detect_img)
-    corners = map_corners_to_frame(corners, offset_x, offset_y, scale)
-    detections: list[tuple[int, float, float]] = []
-    markers: list[tuple[int, float, float, np.ndarray]] = []
 
-    if corners and ids is not None:
-        for marker_corners, marker_id in zip(corners, ids.flatten()):
-            cx, cy = marker_center(marker_corners)
-            detections.append((int(marker_id), cx, cy))
-            markers.append((int(marker_id), cx, cy, marker_corners))
+def submit_tag_task(gray: np.ndarray, detect_img: np.ndarray, offset_x: int, offset_y: int, scale: float) -> bool:
+    with _tag_task_lock:
+        _tag_tasks.append({
+            "gray": gray,
+            "detect_img": detect_img,
+            "offset_x": offset_x,
+            "offset_y": offset_y,
+            "scale": scale,
+            "submitted_at": time.time(),
+        })
+        with stats_lock:
+            stats["tag_queue_depth"] = len(_tag_tasks)
+        _tag_task_event.set()
+    return True
 
-    events = tag_tracker.update(detections)
+
+def consume_tracker_events(events) -> None:
     for event in events:
         post_event(event.tag_id, event.op)
         with stats_lock:
@@ -327,12 +566,87 @@ def detect_and_track(gray: np.ndarray) -> int:
     with stats_lock:
         stats["active_count"] = len(tag_tracker.active_tracks())
 
-    with _overlay_lock:
-        _overlay["gray"] = gray
-        _overlay["markers"] = markers
-        _overlay["tracks"] = list(tag_tracker.active_tracks().values())
+
+def process_tag_task(task: dict) -> int:
+    global _tag_count, _tag_t0, _tag_latest_det_count
+
+    detect_t0 = time.perf_counter()
+    corners, ids = aruco_detector.detect(task["detect_img"])
+    corners = map_corners_to_frame(corners, task["offset_x"], task["offset_y"], task["scale"])
+    tag_ms = (time.perf_counter() - detect_t0) * 1000
+
+    detections: list[tuple[int, float, float]] = []
+    markers: list[tuple[int, float, float, np.ndarray]] = []
+    if corners and ids is not None:
+        for marker_corners, marker_id in zip(corners, ids.flatten()):
+            cx, cy = marker_center(marker_corners)
+            detections.append((int(marker_id), cx, cy))
+            markers.append((int(marker_id), cx, cy, marker_corners))
+
+    events = tag_tracker.update(detections)
+    consume_tracker_events(events)
+    publish_overlay(task["gray"], markers)
+
+    _tag_latest_det_count = len(detections)
+    _tag_count += 1
+    elapsed = time.time() - _tag_t0
+    if elapsed >= 2.0:
+        with stats_lock:
+            stats["fps_tag"] = round(_tag_count / elapsed, 1)
+        _tag_count = 0
+        _tag_t0 = time.time()
+
+    with stats_lock:
+        stats["tag_ms"] = round(tag_ms, 2)
+        stats["last_detections"] = len(detections)
 
     return len(detections)
+
+
+def tag_worker_func():
+    global _tag_worker_running
+
+    while _tag_worker_running:
+        _tag_task_event.wait(0.1)
+        if not _tag_worker_running:
+            break
+
+        with _tag_task_lock:
+            task = _tag_tasks.popleft() if _tag_tasks else None
+            if not _tag_tasks:
+                _tag_task_event.clear()
+            with stats_lock:
+                stats["tag_queue_depth"] = len(_tag_tasks)
+
+        if task is None:
+            continue
+
+        try:
+            process_tag_task(task)
+        except Exception as e:
+            print(f"标签检测错误: {e}")
+
+
+def detect_and_track(gray: np.ndarray) -> int:
+    """轻量帧处理：运动门控 + 异步提交 ArUco ROI。"""
+    h, w = gray.shape[:2]
+    tag_tracker.set_frame_height(h)
+    submitted = False
+
+    detect_img, offset_x, offset_y, scale = detection_window(gray)
+    if detect_img is not None:
+        submit_tag_task(gray, detect_img, offset_x, offset_y, scale)
+        submitted = True
+
+    for roi in edge_scan_rois(gray):
+        edge_img, edge_x, edge_y, edge_scale = build_detection_crop(gray, roi)
+        if edge_img is not None:
+            submit_tag_task(gray, edge_img, edge_x, edge_y, edge_scale)
+            submitted = True
+
+    publish_overlay(gray)
+
+    return _tag_latest_det_count
 
 
 def render_display(det_count: int) -> np.ndarray | None:
@@ -357,6 +671,18 @@ def render_display(det_count: int) -> np.ndarray | None:
     display_img = cv2.cvtColor(disp, cv2.COLOR_GRAY2BGR)
     draw_zones(display_img)
 
+    with stats_lock:
+        roi_text = stats.get("detect_roi", "")
+
+    if roi_text and "," in roi_text:
+        try:
+            rx1, ry1, rx2, ry2 = [int(v) for v in roi_text.split(",")]
+            p1 = (int(rx1 * disp_scale), int(ry1 * disp_scale))
+            p2 = (int(rx2 * disp_scale), int(ry2 * disp_scale))
+            cv2.rectangle(display_img, p1, p2, (180, 120, 255), 1)
+        except Exception:
+            pass
+
     for marker_id, cx, cy, marker_corners in markers:
         sx, sy = int(cx * disp_scale), int(cy * disp_scale)
         pts = (marker_corners.reshape(4, 2) * disp_scale).astype(np.int32)
@@ -377,13 +703,15 @@ def render_display(det_count: int) -> np.ndarray | None:
 
     with stats_lock:
         det_fps = stats["fps_detect"]
+        tag_fps = stats["fps_tag"]
         cap_fps = stats["fps_capture"]
+        dsp_fps = stats.get("fps_render", 0.0)
         backend = stats.get("decode_backend", "?")
         active = stats["active_count"]
 
     status = (
         f"Tag:{det_count} Trk:{active} | "
-        f"Cap{cap_fps} Det{det_fps} [{backend}]"
+        f"Cap{cap_fps} Loop{det_fps} Tag{tag_fps} Dsp{dsp_fps} [{backend}]"
     )
     cv2.putText(display_img, status, (10, 28),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 136), 2)
@@ -460,24 +788,63 @@ def _tick_detect_fps(det_count: int) -> None:
         _detect_t0 = time.time()
 
 
-def _publish_display(display_img: np.ndarray) -> None:
-    global latest_display, latest_display_id
+def _publish_jpeg(jpeg_bytes: bytes) -> None:
+    global latest_jpeg, latest_jpeg_id
 
     with display_lock:
-        latest_display = display_img
-        latest_display_id += 1
+        latest_jpeg = jpeg_bytes
+        latest_jpeg_id += 1
+
+
+_render_count = 0
+_render_t0 = time.time()
+
+
+def render_thread_func():
+    global render_running, _render_count, _render_t0
+
+    encode_params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+    print(f"渲染线程: 目标 {RENDER_FPS}fps (间隔 {RENDER_INTERVAL*1000:.0f}ms)")
+
+    while render_running:
+        _overlay_ready.wait(timeout=RENDER_INTERVAL)
+        _overlay_ready.clear()
+
+        loop_start = time.perf_counter()
+        try:
+            frame = render_display(_tag_latest_det_count)
+            if frame is None:
+                continue
+
+            ret, buffer = cv2.imencode('.jpg', frame, encode_params)
+            if not ret:
+                continue
+
+            _publish_jpeg(buffer.tobytes())
+
+            _render_count += 1
+            elapsed = time.time() - _render_t0
+            if elapsed >= 2.0:
+                with stats_lock:
+                    stats["fps_render"] = round(_render_count / elapsed, 1)
+                    stats["render_ms"] = round((time.perf_counter() - loop_start) * 1000, 2)
+                _render_count = 0
+                _render_t0 = time.time()
+        except Exception as e:
+            print(f"渲染错误: {e}")
+
+        spent = time.perf_counter() - loop_start
+        if spent < RENDER_INTERVAL:
+            time.sleep(RENDER_INTERVAL - spent)
 
 
 def detection_thread_func():
-    """检测全速跑最新帧；画面按 RENDER_INTERVAL 刷新。"""
     global detection_running
 
     print(
-        f"检测线程: {april_detector.backend} "
+        f"检测线程: ArUco {aruco_detector.dictionary} "
         f"frame={PROCESS_WIDTH}x{PROCESS_HEIGHT} display<={DISPLAY_MAX_WIDTH}px"
     )
-
-    last_render = 0.0
 
     while detection_running:
         gray = _take_latest_gray()
@@ -496,20 +863,6 @@ def detection_thread_func():
             continue
 
         _tick_detect_fps(det_count)
-
-        now = time.time()
-        if now - last_render >= RENDER_INTERVAL:
-            try:
-                render_t0 = time.perf_counter()
-                frame = render_display(det_count)
-                render_ms = (time.perf_counter() - render_t0) * 1000
-                with stats_lock:
-                    stats["render_ms"] = round(render_ms, 2)
-                if frame is not None:
-                    _publish_display(frame)
-            except Exception as e:
-                print(f"渲染错误: {e}")
-            last_render = now
 
 
 def capture_thread_func():
@@ -779,38 +1132,57 @@ def start_detection_thread():
     print("检测线程已启动")
 
 
+def start_tag_worker_thread():
+    global _tag_worker_running, tag_worker_thread
+    with worker_lock:
+        if tag_worker_thread is not None and tag_worker_thread.is_alive():
+            return
+        _tag_worker_running = True
+        tag_worker_thread = threading.Thread(target=tag_worker_func, daemon=True)
+        tag_worker_thread.start()
+    print("标签识别线程已启动")
+
+
+def start_render_thread():
+    global render_running, render_thread
+    with worker_lock:
+        if render_thread is not None and render_thread.is_alive():
+            return
+        render_running = True
+        render_thread = threading.Thread(target=render_thread_func, daemon=True)
+        render_thread.start()
+    print("渲染线程已启动")
+
+
 def start_workers():
+    start_tag_worker_thread()
+    start_render_thread()
     start_capture_thread()
     start_detection_thread()
 
 
 def generate_frames():
-    global latest_display, latest_display_id
+    global latest_jpeg, latest_jpeg_id
 
     if not capture_running or not detection_running:
         start_workers()
 
-    while latest_display is None:
-        time.sleep(0.05)
+    while latest_jpeg is None:
+        time.sleep(0.02)
 
-    encode_params = [cv2.IMWRITE_JPEG_QUALITY, 70]
     last_sent_id = -1
 
     while True:
         with display_lock:
-            if latest_display is None or latest_display_id == last_sent_id:
-                time.sleep(0.005)
+            if latest_jpeg is None or latest_jpeg_id == last_sent_id:
+                time.sleep(0.001)
                 continue
-            frame = latest_display.copy()
-            frame_id = latest_display_id
-
-        ret, buffer = cv2.imencode('.jpg', frame, encode_params)
-        if not ret:
-            continue
+            data = latest_jpeg
+            frame_id = latest_jpeg_id
 
         last_sent_id = frame_id
         yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+               b'Content-Type: image/jpeg\r\n\r\n' + data + b'\r\n')
 
 
 @app.route('/')
@@ -852,7 +1224,7 @@ def api_stats():
 @app.route('/api/benchmark')
 def api_benchmark():
     frame = np.full((PROCESS_HEIGHT, PROCESS_WIDTH), 255, dtype=np.uint8)
-    aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+    aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_1000)
     tag_size = max(48, min(PROCESS_WIDTH, PROCESS_HEIGHT) // 5)
     tag = cv2.aruco.generateImageMarker(aruco_dict, 7, tag_size)
     y = (PROCESS_HEIGHT - tag_size) // 2
@@ -863,12 +1235,13 @@ def api_benchmark():
     start = time.perf_counter()
     detections = 0
     for _ in range(iterations):
-        _, ids = april_detector.detect(frame)
+        _, ids = aruco_detector.detect(frame)
         detections += 0 if ids is None else len(ids)
     elapsed = time.perf_counter() - start
 
     return jsonify({
-        "backend": april_detector.backend,
+        "backend": aruco_detector.backend,
+        "dictionary": aruco_detector.dictionary,
         "frame_size": f"{PROCESS_WIDTH}x{PROCESS_HEIGHT}",
         "iterations": iterations,
         "detections": detections,
@@ -878,7 +1251,7 @@ def api_benchmark():
 
 
 def _benchmark_detector_on_frame(
-    detector: AprilTagDetector,
+    detector: ArucoDetector,
     frame: np.ndarray,
     detect_width: int,
     iterations: int,
@@ -921,30 +1294,23 @@ def api_benchmark_latest():
     widths = sorted({PROCESS_WIDTH, DETECT_WIDTH, 360, 320}, reverse=True)
     iterations = 20
     results = []
-
-    detectors = [april_detector]
-    if BENCHMARK_PUPIL and april_detector.backend != "pupil" and PupilDetector is not None:
-        try:
-            detectors.append(AprilTagDetector("pupil"))
-        except Exception:
-            pass
-
-    for detector in detectors:
-        for width in widths:
-            results.append(_benchmark_detector_on_frame(detector, frame, width, iterations))
+    for width in widths:
+        results.append(_benchmark_detector_on_frame(aruco_detector, frame, width, iterations))
 
     return jsonify({
         "frame_size": f"{frame.shape[1]}x{frame.shape[0]}",
+        "dictionary": aruco_detector.dictionary,
         "results": results,
     })
 
 
 if __name__ == '__main__':
     gpu_ok = _ffmpeg_supports_cuda()
-    print("启动 AprilTag 车辆监控服务器...")
+    print("启动 ArUco 车辆监控服务器...")
     print(f"采集: {CAPTURE_BACKEND} {PROCESS_WIDTH}x{PROCESS_HEIGHT}@{CAPTURE_FPS}")
     print(f"GPU: {'FFmpeg CUDA 可用' if gpu_ok else '未检测到 FFmpeg CUDA'}")
-    print(f"检测: {april_detector.backend} qd={PUPIL_QUAD_DECIMATE if april_detector.backend == 'pupil' else '-'}")
+    print(f"检测: OpenCV {aruco_detector.dictionary}")
+    print(f"渲染: {RENDER_FPS}fps JPEG q={JPEG_QUALITY}")
     print("摄像头建议: 曝光手动 1/500~1/2000, 关闭 WDR/3DNR, 增益适中")
     print("访问 http://localhost:5000 查看分析画面")
     start_workers()
